@@ -4,6 +4,22 @@ import (
 	"database/sql"
 )
 
+const postgresGeoInfo = `
+	SELECT
+		f_table_schema,
+		f_table_name,
+		f_geometry_column,
+		type,
+		COALESCE(srid, 0),
+		COALESCE(coord_dimension, 0)
+	FROM
+		geometry_columns
+	ORDER BY
+		f_table_schema,
+		f_table_name,
+		f_geometry_column
+`
+
 // TODO(js) Should we be filtering out system tables, like we currently do?
 
 const postgresAllColumns = `SELECT * FROM %s LIMIT 0`
@@ -96,4 +112,33 @@ func (postgresDialect) TableNames(db *sql.DB) ([][2]string, error) {
 
 func (postgresDialect) ViewNames(db *sql.DB) ([][2]string, error) {
 	return fetchObjectNames(db, postgresViewNamesWithSchema)
+}
+
+func fetchPostgresGeoInfo(db *sql.DB) ([]GeoInfo, error) {
+	rows, err := db.Query(postgresGeoInfo)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []GeoInfo
+	for rows.Next() {
+		var schema, table, column, geomType string
+		var srid, dimension int
+		if err := rows.Scan(&schema, &table, &column, &geomType, &srid, &dimension); err != nil {
+			return nil, err
+		}
+		out = append(out, GeoInfo{
+			Schema:       schema,
+			Table:        table,
+			Column:       column,
+			GeometryType: geomType,
+			SRID:         srid,
+			Dimension:    dimension,
+			Force2D:      dimension <= 2,
+			Source:       "geometry_columns",
+		})
+	}
+
+	return out, nil
 }

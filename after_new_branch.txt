@@ -1,0 +1,20 @@
+=== RUN   TestAnalyzeDiscoveryBaselineSQLite
+--- PASS: TestAnalyzeDiscoveryBaselineSQLite (0.00s)
+=== RUN   TestAnalyzeSQLiteNewFeatures
+    analyze_placeholder_test.go:104: [sqlite:new_features] schemas=1 tables=2 views=1 geoinfo=1
+    analyze_placeholder_test.go:104: [sqlite:new_features] tables: gpkg_geometry_columns, places
+    analyze_placeholder_test.go:104: [sqlite:new_features] views: places_view
+    analyze_placeholder_test.go:104: [sqlite:new_features] first geoinfo: .places.geom type=POINT srid=4326 dim=2 source=gpkg_geometry_columns
+--- PASS: TestAnalyzeSQLiteNewFeatures (0.00s)
+=== RUN   TestAnalyzeDiscoveryExternalDB
+    analyze_placeholder_test.go:238: [external:analyze] schemas=1 tables=1 views=0 geoinfo=422
+    analyze_placeholder_test.go:238: [external:analyze] tables: ALKIS.o02341
+    analyze_placeholder_test.go:238: [external:analyze] views: -
+    analyze_placeholder_test.go:238: [external:analyze] first geoinfo: ALKIS.o02310.position type=MULTIPOINT srid=25832 dim=2 source=geometry_columns
+    analyze_placeholder_test.go:274: [external:filtered] schemas=0 tables=0 views=0 geoinfo=422
+    analyze_placeholder_test.go:274: [external:filtered] tables: -
+    analyze_placeholder_test.go:274: [external:filtered] views: -
+    analyze_placeholder_test.go:274: [external:filtered] first geoinfo: ALKIS.o02310.position type=MULTIPOINT srid=25832 dim=2 source=geometry_columns
+--- PASS: TestAnalyzeDiscoveryExternalDB (22.75s)
+PASS
+ok  	github.com/jimsmart/schema	23.007s

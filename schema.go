@@ -3,6 +3,8 @@ package schema
 import (
 	"database/sql"
 	"fmt"
+	"regexp"
+	"strings"
 )
 
 // https://github.com/golang/go/issues/7408
@@ -20,6 +22,62 @@ import (
 //
 
 //
+
+// AnalyzeOptions controls discovery behavior for Analyze.
+type AnalyzeOptions struct {
+	IncludeSchemas []string
+	ExcludeSchemas []string
+	IncludeTables  []string
+	ExcludeTables  []string
+}
+
+// AnalyzeResult is a structured discovery response.
+type AnalyzeResult struct {
+	Schemas []SchemaMeta
+	Tables  []TableMeta
+	Views   []TableMeta
+	GeoInfo []GeoInfo
+}
+
+type SchemaMeta struct {
+	Name string
+}
+
+type TableMeta struct {
+	Schema      string
+	Name        string
+	IsView      bool
+	Columns     []ColumnMeta
+	Constraints []ConstraintMeta
+	BaseTables  [][2]string
+}
+
+type ColumnMeta struct {
+	Name       string
+	Type       string
+	Nullable   bool
+	IsPrimary  bool
+	IsUnique   bool
+	IsReadOnly bool
+	IsSpatial  bool
+	IsTemporal bool
+}
+
+type ConstraintMeta struct {
+	Type    string
+	Columns []string
+}
+
+type GeoInfo struct {
+	Schema       string
+	Table        string
+	Column       string
+	GeometryType string
+	SRID         int
+	Dimension    int
+	Force2D      bool
+	Source       string
+}
 
 // UnknownDriverError is returned when there is no matching
 // database driver type name in the driverDialect table.
@@ -131,6 +189,225 @@ func PrimaryKey(db *sql.DB, schema, table string) ([]string, error) {
 		return nil, err
 	}
 	return d.PrimaryKey(db, schema, table)
+}
+
+// Analyze discovers tables/views/columns/constraints and returns a structured response.
+func Analyze(db *sql.DB, opts *AnalyzeOptions) (AnalyzeResult, error) {
+	res := AnalyzeResult{}
+
+	tables, err := TableNames(db)
+	if err != nil {
+		return res, err
+	}
+	views, err := ViewNames(db)
+	if err != nil {
+		return res, err
+	}
+
+	schemas := map[string]struct{}{}
+	for _, t := range tables {
+		if !includedSchema(t[0], opts) || !includedName(t[1], includeTables(opts), excludeTables(opts)) {
+			continue
+		}
+		schemas[t[0]] = struct{}{}
+		meta, err := loadTableMeta(db, t[0], t[1], false)
+		if err != nil {
+			return res, err
+		}
+		res.Tables = append(res.Tables, meta)
+	}
+
+	for _, v := range views {
+		if !includedSchema(v[0], opts) || !includedName(v[1], includeTables(opts), excludeTables(opts)) {
+			continue
+		}
+		schemas[v[0]] = struct{}{}
+		meta, err := loadTableMeta(db, v[0], v[1], true)
+		if err != nil {
+			return res, err
+		}
+		meta.BaseTables, _ = resolveViewBaseTables(db, v[0], v[1])
+		res.Views = append(res.Views, meta)
+	}
+
+	for s := range schemas {
+		res.Schemas = append(res.Schemas, SchemaMeta{Name: s})
+	}
+
+	// Spatial metadata hooks per dialect (best-effort).
+	d, err := getDialect(db)
+	if err == nil {
+		switch d.(type) {
+		case postgresDialect:
+			geo, gErr := fetchPostgresGeoInfo(db)
+			if gErr == nil {
+				res.GeoInfo = append(res.GeoInfo, geo...)
+			}
+		case sqliteDialect:
+			geo, gErr := fetchSqliteGeoInfo(db)
+			if gErr == nil {
+				res.GeoInfo = append(res.GeoInfo, geo...)
+			}
+		}
+	}
+
+	return res, nil
+}
+
+func loadTableMeta(db *sql.DB, schema, name string, isView bool) (TableMeta, error) {
+	meta := TableMeta{Schema: schema, Name: name, IsView: isView}
+
+	cts, err := ColumnTypes(db, schema, name)
+	if err != nil {
+		return meta, err
+	}
+	pk, err := PrimaryKey(db, schema, name)
+	if err != nil {
+		pk = nil
+	}
+
+	for _, ct := range cts {
+		nullable, _ := ct.Nullable()
+		colName := ct.Name()
+		dbType := ct.DatabaseTypeName()
+		meta.Columns = append(meta.Columns, ColumnMeta{
+			Name:       colName,
+			Type:       dbType,
+			Nullable:   nullable,
+			IsPrimary:  exists(colName, pk),
+			IsUnique:   isUnique(colName, pk),
+			IsReadOnly: isReadOnly(ct, isView),
+			IsSpatial:  isSpatial(dbType, colName),
+			IsTemporal: isTemporal(dbType, colName),
+		})
+	}
+
+	if len(pk) > 0 {
+		meta.Constraints = append(meta.Constraints, ConstraintMeta{Type: "PRIMARY_KEY", Columns: pk})
+	}
+
+	return meta, nil
+}
+
+func includedSchema(name string, opts *AnalyzeOptions) bool {
+	if opts == nil {
+		return true
+	}
+	if len(opts.IncludeSchemas) > 0 && !includedName(name, opts.IncludeSchemas, nil) {
+		return false
+	}
+	if len(opts.ExcludeSchemas) > 0 && !includedName(name, nil, opts.ExcludeSchemas) {
+		return false
+	}
+	return true
+}
+
+func includeTables(opts *AnalyzeOptions) []string {
+	if opts == nil {
+		return nil
+	}
+	return opts.IncludeTables
+}
+
+func excludeTables(opts *AnalyzeOptions) []string {
+	if opts == nil {
+		return nil
+	}
+	return opts.ExcludeTables
+}
+
+func includedName(name string, includes, excludes []string) bool {
+	if len(includes) > 0 {
+		matched := false
+		for _, p := range includes {
+			if regexp.MustCompile(p).MatchString(name) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	for _, p := range excludes {
+		if regexp.MustCompile(p).MatchString(name) {
+			return false
+		}
+	}
+	return true
+}
+
+func isUnique(column string, uniqueColumns []string) bool {
+	return exists(column, uniqueColumns)
+}
+
+func isReadOnly(_ *sql.ColumnType, objectIsView bool) bool {
+	return objectIsView
+}
+
+func exists(value string, list []string) bool {
+	for _, v := range list {
+		if strings.EqualFold(v, value) {
+			return true
+		}
+	}
+	return false
+}
+
+func isSpatial(databaseType, columnName string) bool {
+	t := strings.ToLower(databaseType + " " + columnName)
+	return strings.Contains(t, "geom") || strings.Contains(t, "geometry") || strings.Contains(t, "geography")
+}
+
+func isTemporal(databaseType, columnName string) bool {
+	t := strings.ToLower(databaseType + " " + columnName)
+	return strings.Contains(t, "date") || strings.Contains(t, "time") || strings.Contains(t, "timestamp")
+}
+
+// resolveViewBaseTables attempts to resolve base tables used by a view.
+func resolveViewBaseTables(db *sql.DB, schema, view string) ([][2]string, error) {
+	d, err := getDialect(db)
+	if err != nil {
+		return nil, err
+	}
+
+	switch d.(type) {
+	case postgresDialect:
+		const postgresViewBaseTables = `
+			SELECT table_schema, table_name
+			FROM information_schema.view_table_usage
+			WHERE view_schema = $1 AND view_name = $2
+			ORDER BY table_schema, table_name`
+		rows, qErr := db.Query(postgresViewBaseTables, schema, view)
+		if qErr != nil {
+			return nil, qErr
+		}
+		defer rows.Close()
+		var out [][2]string
+		for rows.Next() {
+			var s, n string
+			if scanErr := rows.Scan(&s, &n); scanErr != nil {
+				return nil, scanErr
+			}
+			out = append(out, [2]string{s, n})
+		}
+		return out, nil
+	case sqliteDialect:
+		const sqliteViewSql = `SELECT sql FROM sqlite_master WHERE type='view' AND name = ?`
+		var sqlText string
+		if qErr := db.QueryRow(sqliteViewSql, view).Scan(&sqlText); qErr != nil {
+			return nil, qErr
+		}
+		re := regexp.MustCompile(`(?i)\bfrom\s+([a-zA-Z0-9_\."]+)`)
+		m := re.FindStringSubmatch(sqlText)
+		if len(m) < 2 {
+			return nil, nil
+		}
+		tbl := strings.Trim(m[1], `"`)
+		return [][2]string{{"", tbl}}, nil
+	default:
+		return nil, nil
+	}
 }
 
 // fetchNames executes the given query with an optional name parameter,
