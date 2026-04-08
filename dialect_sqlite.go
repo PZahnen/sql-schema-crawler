@@ -1,7 +1,12 @@
 package schema
 
 import (
+	"context"
 	"database/sql"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
 )
 
 const sqliteGeoInfo = `
@@ -115,4 +120,140 @@ func fetchSqliteGeoInfo(db *sql.DB) ([]GeoInfo, error) {
 	}
 
 	return out, nil
+}
+
+func fetchSqliteUniqueColumns(db *sql.DB, schema, table string) ([]string, error) {
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	indexListSQL := fmt.Sprintf("PRAGMA index_list('%s')", sqliteQuoteLiteral(table))
+	rows, err := conn.QueryContext(ctx, indexListSQL)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	indexListCols, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+
+	var uniqueIndexes []string
+	for rows.Next() {
+		idxName, isUniq, err := scanSqliteIndexListRow(rows, indexListCols)
+		if err != nil {
+			return nil, err
+		}
+		if isUniq != 1 {
+			continue
+		}
+		uniqueIndexes = append(uniqueIndexes, idxName)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+
+	unique := map[string]struct{}{}
+	for _, idxName := range uniqueIndexes {
+		indexInfoSQL := fmt.Sprintf("PRAGMA index_info('%s')", sqliteQuoteLiteral(idxName))
+		idxRows, err := conn.QueryContext(ctx, indexInfoSQL)
+		if err != nil {
+			return nil, err
+		}
+
+		var cols []string
+		for idxRows.Next() {
+			var seqno, cid int
+			var col string
+			if err := idxRows.Scan(&seqno, &cid, &col); err != nil {
+				idxRows.Close()
+				return nil, err
+			}
+			cols = append(cols, col)
+		}
+		if err := idxRows.Close(); err != nil {
+			return nil, err
+		}
+
+		if len(cols) == 1 {
+			if cols[0] != "" {
+				unique[cols[0]] = struct{}{}
+			}
+		}
+	}
+
+	res := make([]string, 0, len(unique))
+	for col := range unique {
+		res = append(res, col)
+	}
+	sort.Strings(res)
+	return res, nil
+}
+
+func scanSqliteIndexListRow(rows *sql.Rows, cols []string) (string, int, error) {
+	vals := make([]interface{}, len(cols))
+	ptrs := make([]interface{}, len(cols))
+	for i := range vals {
+		ptrs[i] = &vals[i]
+	}
+	if err := rows.Scan(ptrs...); err != nil {
+		return "", 0, err
+	}
+
+	idxName := ""
+	isUniq := 0
+	for i, c := range cols {
+		switch strings.ToLower(c) {
+		case "name":
+			idxName = toString(vals[i])
+		case "unique":
+			isUniq = toInt(vals[i])
+		}
+	}
+	return idxName, isUniq, nil
+}
+
+func toString(v interface{}) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case []byte:
+		return string(t)
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+func toInt(v interface{}) int {
+	switch t := v.(type) {
+	case int:
+		return t
+	case int64:
+		return int(t)
+	case int32:
+		return int(t)
+	case bool:
+		if t {
+			return 1
+		}
+		return 0
+	case string:
+		n, _ := strconv.Atoi(t)
+		return n
+	case []byte:
+		n, _ := strconv.Atoi(string(t))
+		return n
+	default:
+		return 0
+	}
+}
+
+func sqliteQuoteLiteral(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
 }

@@ -88,6 +88,78 @@ const postgresPrimaryKeyWithSchema = `
 		kcu.ordinal_position
 `
 
+const postgresUniqueColumns = `
+	WITH single_col_constraints AS (
+		SELECT
+			kcu.constraint_schema,
+			kcu.constraint_name
+		FROM
+			information_schema.key_column_usage kcu
+		WHERE
+			kcu.table_schema = current_schema() AND
+			kcu.table_name = $1
+		GROUP BY
+			kcu.constraint_schema,
+			kcu.constraint_name
+		HAVING
+			COUNT(*) = 1
+	)
+	SELECT
+		kcu.column_name
+	FROM
+		information_schema.table_constraints tc
+	JOIN
+		information_schema.key_column_usage kcu
+	ON	kcu.constraint_name = tc.constraint_name AND
+		kcu.constraint_schema = tc.constraint_schema
+	JOIN
+		single_col_constraints scc
+	ON	scc.constraint_name = tc.constraint_name AND
+		scc.constraint_schema = tc.constraint_schema
+	WHERE
+		tc.constraint_type = 'UNIQUE' AND
+		kcu.table_schema = current_schema() AND
+		kcu.table_name = $1
+	ORDER BY
+		kcu.ordinal_position
+`
+
+const postgresUniqueColumnsWithSchema = `
+	WITH single_col_constraints AS (
+		SELECT
+			kcu.constraint_schema,
+			kcu.constraint_name
+		FROM
+			information_schema.key_column_usage kcu
+		WHERE
+			kcu.table_schema = $1 AND
+			kcu.table_name = $2
+		GROUP BY
+			kcu.constraint_schema,
+			kcu.constraint_name
+		HAVING
+			COUNT(*) = 1
+	)
+	SELECT
+		kcu.column_name
+	FROM
+		information_schema.table_constraints tc
+	JOIN
+		information_schema.key_column_usage kcu
+	ON	kcu.constraint_name = tc.constraint_name AND
+		kcu.constraint_schema = tc.constraint_schema
+	JOIN
+		single_col_constraints scc
+	ON	scc.constraint_name = tc.constraint_name AND
+		scc.constraint_schema = tc.constraint_schema
+	WHERE
+		tc.constraint_type = 'UNIQUE' AND
+		kcu.table_schema = $1 AND
+		kcu.table_name = $2
+	ORDER BY
+		kcu.ordinal_position
+`
+
 type postgresDialect struct{}
 
 func (postgresDialect) escapeIdent(ident string) string {
@@ -141,4 +213,11 @@ func fetchPostgresGeoInfo(db *sql.DB) ([]GeoInfo, error) {
 	}
 
 	return out, nil
+}
+
+func fetchPostgresUniqueColumns(db *sql.DB, schema, name string) ([]string, error) {
+	if schema == "" {
+		return fetchNames(db, postgresUniqueColumns, "", name)
+	}
+	return fetchNames(db, postgresUniqueColumnsWithSchema, schema, name)
 }

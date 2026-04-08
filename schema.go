@@ -265,6 +265,10 @@ func loadTableMeta(db *sql.DB, schema, name string, isView bool) (TableMeta, err
 	if err != nil {
 		pk = nil
 	}
+	uniqueCols, err := uniqueColumns(db, schema, name)
+	if err != nil {
+		uniqueCols = nil
+	}
 
 	for _, ct := range cts {
 		nullable, _ := ct.Nullable()
@@ -275,7 +279,7 @@ func loadTableMeta(db *sql.DB, schema, name string, isView bool) (TableMeta, err
 			Type:       dbType,
 			Nullable:   nullable,
 			IsPrimary:  exists(colName, pk),
-			IsUnique:   isUnique(colName, pk),
+			IsUnique:   isUnique(colName, pk, uniqueCols),
 			IsReadOnly: isReadOnly(ct, isView),
 			IsSpatial:  isSpatial(dbType, colName),
 			IsTemporal: isTemporal(dbType, colName),
@@ -337,8 +341,27 @@ func includedName(name string, includes, excludes []string) bool {
 	return true
 }
 
-func isUnique(column string, uniqueColumns []string) bool {
+func isUnique(column string, primaryKeyColumns, uniqueColumns []string) bool {
+	if exists(column, primaryKeyColumns) {
+		return true
+	}
 	return exists(column, uniqueColumns)
+}
+
+func uniqueColumns(db *sql.DB, schema, table string) ([]string, error) {
+	d, err := getDialect(db)
+	if err != nil {
+		return nil, err
+	}
+
+	switch d.(type) {
+	case postgresDialect:
+		return fetchPostgresUniqueColumns(db, schema, table)
+	case sqliteDialect:
+		return fetchSqliteUniqueColumns(db, schema, table)
+	default:
+		return nil, nil
+	}
 }
 
 func isReadOnly(_ *sql.ColumnType, objectIsView bool) bool {

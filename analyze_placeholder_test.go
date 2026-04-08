@@ -79,7 +79,8 @@ func TestAnalyzeSQLiteNewFeatures(t *testing.T) {
 	defer db.Close()
 
 	stmts := []string{
-		`CREATE TABLE places (id INTEGER PRIMARY KEY, name TEXT NOT NULL, geom TEXT, created_at TIMESTAMP);`,
+		`CREATE TABLE places (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT, geom TEXT, created_at TIMESTAMP);`,
+		`CREATE UNIQUE INDEX idx_places_email_unique ON places(email);`,
 		`CREATE VIEW places_view AS SELECT id, name FROM places;`,
 		`CREATE TABLE gpkg_geometry_columns (
 			table_name TEXT NOT NULL,
@@ -122,6 +123,9 @@ func TestAnalyzeSQLiteNewFeatures(t *testing.T) {
 	}
 	if !hasColumnFlag(places, "created_at", func(c ColumnMeta) bool { return c.IsTemporal }) {
 		t.Fatalf("expected created_at column to be marked temporal")
+	}
+	if !hasColumnFlag(places, "email", func(c ColumnMeta) bool { return c.IsUnique && !c.IsPrimary }) {
+		t.Fatalf("expected email column to be marked unique via unique index (not via primary key)")
 	}
 
 	v, ok := findTableMeta(res.Views, "", "places_view")
