@@ -81,6 +81,12 @@ func TestAnalyzeSQLiteNewFeatures(t *testing.T) {
 	stmts := []string{
 		`CREATE TABLE places (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT, geom TEXT, created_at TIMESTAMP);`,
 		`CREATE UNIQUE INDEX idx_places_email_unique ON places(email);`,
+		`CREATE TABLE generated_demo (
+			id INTEGER PRIMARY KEY,
+			first_name TEXT,
+			last_name TEXT,
+			full_name TEXT GENERATED ALWAYS AS (first_name || ' ' || last_name) STORED
+		);`,
 		`CREATE VIEW places_view AS SELECT id, name FROM places;`,
 		`CREATE TABLE gpkg_geometry_columns (
 			table_name TEXT NOT NULL,
@@ -104,8 +110,8 @@ func TestAnalyzeSQLiteNewFeatures(t *testing.T) {
 	}
 	logAnalyzeSummary(t, "sqlite:new_features", res)
 
-	if len(res.Tables) != 2 { // places + gpkg_geometry_columns
-		t.Fatalf("expected 2 tables, got %d", len(res.Tables))
+	if len(res.Tables) != 3 { // places + generated_demo + gpkg_geometry_columns
+		t.Fatalf("expected 3 tables, got %d", len(res.Tables))
 	}
 	if len(res.Views) != 1 {
 		t.Fatalf("expected 1 view, got %d", len(res.Views))
@@ -128,6 +134,17 @@ func TestAnalyzeSQLiteNewFeatures(t *testing.T) {
 		t.Fatalf("expected email column to be marked unique via unique index (not via primary key)")
 	}
 
+	generatedDemo, ok := findTableMeta(res.Tables, "", "generated_demo")
+	if !ok {
+		t.Fatalf("Analyze result missing table generated_demo")
+	}
+	if !hasColumnFlag(generatedDemo, "full_name", func(c ColumnMeta) bool { return c.IsReadOnly }) {
+		t.Fatalf("expected generated column full_name to be marked read-only")
+	}
+	if hasColumnFlag(generatedDemo, "first_name", func(c ColumnMeta) bool { return c.IsReadOnly }) {
+		t.Fatalf("expected first_name to stay writable (not read-only)")
+	}
+
 	v, ok := findTableMeta(res.Views, "", "places_view")
 	if !ok {
 		t.Fatalf("Analyze result missing view places_view")
@@ -135,8 +152,8 @@ func TestAnalyzeSQLiteNewFeatures(t *testing.T) {
 	if !v.IsView {
 		t.Fatalf("expected places_view meta to be flagged as view")
 	}
-	if !allColumnsReadOnly(v) {
-		t.Fatalf("expected all view columns to be read-only")
+	if allColumnsReadOnly(v) {
+		t.Fatalf("did not expect all view columns to be read-only (xtraplatform-style read-only is column-metadata based)")
 	}
 
 	if len(res.GeoInfo) == 0 {
@@ -153,6 +170,9 @@ func TestAnalyzeSQLiteNewFeatures(t *testing.T) {
 	if len(filtered.Views) != 0 {
 		t.Fatalf("expected no views when IncludeTables is ^places$, got %d", len(filtered.Views))
 	}
+	if len(filtered.GeoInfo) != 1 {
+		t.Fatalf("expected 1 GeoInfo entry after include filter, got %d", len(filtered.GeoInfo))
+	}
 
 	excluded, err := Analyze(db, &AnalyzeOptions{ExcludeTables: []string{"^places$"}})
 	if err != nil {
@@ -160,6 +180,9 @@ func TestAnalyzeSQLiteNewFeatures(t *testing.T) {
 	}
 	if containsObject(excluded.Tables, "", "places") {
 		t.Fatalf("expected places to be excluded by ExcludeTables")
+	}
+	if len(excluded.GeoInfo) != 0 {
+		t.Fatalf("expected GeoInfo to exclude places entries too, got %d", len(excluded.GeoInfo))
 	}
 }
 
@@ -278,6 +301,9 @@ func TestAnalyzeDiscoveryExternalDB(t *testing.T) {
 	logAnalyzeSummary(t, "external:filtered", filtered)
 	if len(filtered.Tables) != 0 || len(filtered.Views) != 0 {
 		t.Fatalf("expected empty Analyze result for IncludeTables=^$, got tables=%d views=%d", len(filtered.Tables), len(filtered.Views))
+	}
+	if len(filtered.GeoInfo) != 0 {
+		t.Fatalf("expected empty Analyze GeoInfo for IncludeTables=^$, got geoinfo=%d", len(filtered.GeoInfo))
 	}
 }
 

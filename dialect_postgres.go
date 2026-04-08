@@ -160,6 +160,32 @@ const postgresUniqueColumnsWithSchema = `
 		kcu.ordinal_position
 `
 
+const postgresReadOnlyColumns = `
+	SELECT
+		column_name
+	FROM
+		information_schema.columns
+	WHERE
+		table_schema = current_schema() AND
+		table_name = $1 AND
+		(is_identity = 'YES' OR is_generated <> 'NEVER')
+	ORDER BY
+		ordinal_position
+`
+
+const postgresReadOnlyColumnsWithSchema = `
+	SELECT
+		column_name
+	FROM
+		information_schema.columns
+	WHERE
+		table_schema = $1 AND
+		table_name = $2 AND
+		(is_identity = 'YES' OR is_generated <> 'NEVER')
+	ORDER BY
+		ordinal_position
+`
+
 type postgresDialect struct{}
 
 func (postgresDialect) escapeIdent(ident string) string {
@@ -220,4 +246,11 @@ func fetchPostgresUniqueColumns(db *sql.DB, schema, name string) ([]string, erro
 		return fetchNames(db, postgresUniqueColumns, "", name)
 	}
 	return fetchNames(db, postgresUniqueColumnsWithSchema, schema, name)
+}
+
+func fetchPostgresReadOnlyColumns(db *sql.DB, schema, name string) ([]string, error) {
+	if schema == "" {
+		return fetchNames(db, postgresReadOnlyColumns, "", name)
+	}
+	return fetchNames(db, postgresReadOnlyColumnsWithSchema, schema, name)
 }

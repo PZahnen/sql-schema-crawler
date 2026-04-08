@@ -196,6 +196,43 @@ func fetchSqliteUniqueColumns(db *sql.DB, schema, table string) ([]string, error
 	return res, nil
 }
 
+func fetchSqliteReadOnlyColumns(db *sql.DB, schema, table string) ([]string, error) {
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	q := fmt.Sprintf("PRAGMA table_xinfo('%s')", sqliteQuoteLiteral(table))
+	rows, err := conn.QueryContext(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var (
+			cid       int
+			name      string
+			typ       string
+			notnull   int
+			dfltValue interface{}
+			pk        int
+			hidden    int
+		)
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dfltValue, &pk, &hidden); err != nil {
+			return nil, err
+		}
+		// hidden=2/3 => generated columns in SQLite.
+		if hidden == 2 || hidden == 3 {
+			out = append(out, name)
+		}
+	}
+	return out, rows.Err()
+}
+
 func scanSqliteIndexListRow(rows *sql.Rows, cols []string) (string, int, error) {
 	vals := make([]interface{}, len(cols))
 	ptrs := make([]interface{}, len(cols))

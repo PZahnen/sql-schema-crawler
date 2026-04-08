@@ -241,12 +241,12 @@ func Analyze(db *sql.DB, opts *AnalyzeOptions) (AnalyzeResult, error) {
 		case postgresDialect:
 			geo, gErr := fetchPostgresGeoInfo(db)
 			if gErr == nil {
-				res.GeoInfo = append(res.GeoInfo, geo...)
+				res.GeoInfo = append(res.GeoInfo, filterGeoInfo(geo, opts)...)
 			}
 		case sqliteDialect:
 			geo, gErr := fetchSqliteGeoInfo(db)
 			if gErr == nil {
-				res.GeoInfo = append(res.GeoInfo, geo...)
+				res.GeoInfo = append(res.GeoInfo, filterGeoInfo(geo, opts)...)
 			}
 		}
 	}
@@ -269,6 +269,10 @@ func loadTableMeta(db *sql.DB, schema, name string, isView bool) (TableMeta, err
 	if err != nil {
 		uniqueCols = nil
 	}
+	readOnlyCols, err := readOnlyColumns(db, schema, name, isView)
+	if err != nil {
+		readOnlyCols = nil
+	}
 
 	for _, ct := range cts {
 		nullable, _ := ct.Nullable()
@@ -280,7 +284,7 @@ func loadTableMeta(db *sql.DB, schema, name string, isView bool) (TableMeta, err
 			Nullable:   nullable,
 			IsPrimary:  exists(colName, pk),
 			IsUnique:   isUnique(colName, pk, uniqueCols),
-			IsReadOnly: isReadOnly(ct, isView),
+			IsReadOnly: exists(colName, readOnlyCols),
 			IsSpatial:  isSpatial(dbType, colName),
 			IsTemporal: isTemporal(dbType, colName),
 		})
@@ -341,6 +345,23 @@ func includedName(name string, includes, excludes []string) bool {
 	return true
 }
 
+func filterGeoInfo(in []GeoInfo, opts *AnalyzeOptions) []GeoInfo {
+	if opts == nil {
+		return in
+	}
+	out := make([]GeoInfo, 0, len(in))
+	for _, g := range in {
+		if !includedSchema(g.Schema, opts) {
+			continue
+		}
+		if !includedName(g.Table, includeTables(opts), excludeTables(opts)) {
+			continue
+		}
+		out = append(out, g)
+	}
+	return out
+}
+
 func isUnique(column string, primaryKeyColumns, uniqueColumns []string) bool {
 	if exists(column, primaryKeyColumns) {
 		return true
@@ -364,8 +385,26 @@ func uniqueColumns(db *sql.DB, schema, table string) ([]string, error) {
 	}
 }
 
-func isReadOnly(_ *sql.ColumnType, objectIsView bool) bool {
-	return objectIsView
+func readOnlyColumns(db *sql.DB, schema, table string, isView bool) ([]string, error) {
+	if isView {
+		// xtraplatform resolves view columns to base columns; we currently do not do
+		// that at column-level, so we avoid blanket-readonly for all view columns.
+		return nil, nil
+	}
+
+	d, err := getDialect(db)
+	if err != nil {
+		return nil, err
+	}
+
+	switch d.(type) {
+	case postgresDialect:
+		return fetchPostgresReadOnlyColumns(db, schema, table)
+	case sqliteDialect:
+		return fetchSqliteReadOnlyColumns(db, schema, table)
+	default:
+		return nil, nil
+	}
 }
 
 func exists(value string, list []string) bool {
