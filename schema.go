@@ -50,6 +50,14 @@ type TableMeta struct {
 	Columns     []ColumnMeta
 	Constraints []ConstraintMeta
 	BaseTables  [][2]string
+	BaseColumns []ViewColumnOrigin
+}
+
+type ViewColumnOrigin struct {
+	ViewColumn string
+	Schema     string
+	Table      string
+	Column     string
 }
 
 type ColumnMeta struct {
@@ -274,19 +282,74 @@ func loadTableMeta(db *sql.DB, schema, name string, isView bool) (TableMeta, err
 		readOnlyCols = nil
 	}
 
+	viewOrigins := map[string]ViewColumnOrigin{}
+	baseFlags := map[[2]string]struct {
+		pk        []string
+		unique    []string
+		readOnly  []string
+		colDBType map[string]string
+	}{}
+	if isView {
+		origins, _ := resolveViewBaseColumns(db, schema, name)
+		meta.BaseColumns = origins
+		for _, o := range origins {
+			viewOrigins[strings.ToLower(o.ViewColumn)] = o
+			key := [2]string{o.Schema, o.Table}
+			if _, ok := baseFlags[key]; ok {
+				continue
+			}
+			pk, _ := PrimaryKey(db, o.Schema, o.Table)
+			uq, _ := uniqueColumns(db, o.Schema, o.Table)
+			ro, _ := readOnlyColumns(db, o.Schema, o.Table, false)
+			ct, _ := ColumnTypes(db, o.Schema, o.Table)
+			tm := map[string]string{}
+			for _, c := range ct {
+				tm[strings.ToLower(c.Name())] = c.DatabaseTypeName()
+			}
+			baseFlags[key] = struct {
+				pk        []string
+				unique    []string
+				readOnly  []string
+				colDBType map[string]string
+			}{pk: pk, unique: uq, readOnly: ro, colDBType: tm}
+		}
+	}
+
 	for _, ct := range cts {
 		nullable, _ := ct.Nullable()
 		colName := ct.Name()
 		dbType := ct.DatabaseTypeName()
+
+		isPrimary := exists(colName, pk)
+		isUniqueCol := isUnique(colName, pk, uniqueCols)
+		isReadOnlyCol := exists(colName, readOnlyCols)
+		isSpatialCol := isSpatial(dbType, colName)
+		isTemporalCol := isTemporal(dbType, colName)
+
+		if isView {
+			if origin, ok := viewOrigins[strings.ToLower(colName)]; ok {
+				if bf, ok := baseFlags[[2]string{origin.Schema, origin.Table}]; ok {
+					baseCol := origin.Column
+					isPrimary = exists(baseCol, bf.pk)
+					isUniqueCol = isUnique(baseCol, bf.pk, bf.unique)
+					isReadOnlyCol = exists(baseCol, bf.readOnly)
+					if t, ok := bf.colDBType[strings.ToLower(baseCol)]; ok {
+						isSpatialCol = isSpatial(t, baseCol)
+						isTemporalCol = isTemporal(t, baseCol)
+					}
+				}
+			}
+		}
+
 		meta.Columns = append(meta.Columns, ColumnMeta{
 			Name:       colName,
 			Type:       dbType,
 			Nullable:   nullable,
-			IsPrimary:  exists(colName, pk),
-			IsUnique:   isUnique(colName, pk, uniqueCols),
-			IsReadOnly: exists(colName, readOnlyCols),
-			IsSpatial:  isSpatial(dbType, colName),
-			IsTemporal: isTemporal(dbType, colName),
+			IsPrimary:  isPrimary,
+			IsUnique:   isUniqueCol,
+			IsReadOnly: isReadOnlyCol,
+			IsSpatial:  isSpatialCol,
+			IsTemporal: isTemporalCol,
 		})
 	}
 
@@ -470,6 +533,138 @@ func resolveViewBaseTables(db *sql.DB, schema, view string) ([][2]string, error)
 	default:
 		return nil, nil
 	}
+}
+
+func resolveViewBaseColumns(db *sql.DB, schema, view string) ([]ViewColumnOrigin, error) {
+	def, err := fetchViewDefinition(db, schema, view)
+	if err != nil {
+		return nil, err
+	}
+	return parseViewColumnOrigins(def)
+}
+
+func fetchViewDefinition(db *sql.DB, schema, view string) (string, error) {
+	d, err := getDialect(db)
+	if err != nil {
+		return "", err
+	}
+
+	switch d.(type) {
+	case postgresDialect:
+		q := `SELECT pg_get_viewdef(format('%I.%I', COALESCE(NULLIF($1,''), current_schema()), $2)::regclass, true)`
+		var def string
+		if err := db.QueryRow(q, schema, view).Scan(&def); err != nil {
+			return "", err
+		}
+		return def, nil
+	case sqliteDialect:
+		q := `SELECT sql FROM sqlite_master WHERE type='view' AND name = ?`
+		var def string
+		if err := db.QueryRow(q, view).Scan(&def); err != nil {
+			return "", err
+		}
+		return def, nil
+	default:
+		return "", nil
+	}
+}
+
+func parseViewColumnOrigins(def string) ([]ViewColumnOrigin, error) {
+	m := regexp.MustCompile(`(?is)\bselect\b(.*?)\bfrom\b\s+([a-zA-Z0-9_\."` + "`" + `]+)`).FindStringSubmatch(def)
+	if len(m) < 3 {
+		return nil, nil
+	}
+
+	selectPart := m[1]
+	fromIdent := strings.TrimSpace(m[2])
+	fromSchema, fromTable := parseQualifiedIdentifier(fromIdent)
+
+	items := splitSelectList(selectPart)
+	out := make([]ViewColumnOrigin, 0, len(items))
+	for _, item := range items {
+		expr, alias := splitExprAndAlias(item)
+		baseCol := parseSimpleColumnExpr(expr)
+		if baseCol == "" {
+			continue
+		}
+		viewCol := alias
+		if viewCol == "" {
+			viewCol = baseCol
+		}
+		out = append(out, ViewColumnOrigin{
+			ViewColumn: viewCol,
+			Schema:     fromSchema,
+			Table:      fromTable,
+			Column:     baseCol,
+		})
+	}
+	return out, nil
+}
+
+func parseQualifiedIdentifier(in string) (string, string) {
+	parts := strings.Split(strings.TrimSpace(in), ".")
+	if len(parts) == 1 {
+		return "", unquoteIdent(parts[0])
+	}
+	return unquoteIdent(parts[len(parts)-2]), unquoteIdent(parts[len(parts)-1])
+}
+
+func splitSelectList(s string) []string {
+	var out []string
+	start, depth := 0, 0
+	inQuote := false
+	for i, r := range s {
+		switch r {
+		case '"':
+			inQuote = !inQuote
+		case '(':
+			if !inQuote {
+				depth++
+			}
+		case ')':
+			if !inQuote && depth > 0 {
+				depth--
+			}
+		case ',':
+			if !inQuote && depth == 0 {
+				out = append(out, strings.TrimSpace(s[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	if tail := strings.TrimSpace(s[start:]); tail != "" {
+		out = append(out, tail)
+	}
+	return out
+}
+
+func splitExprAndAlias(item string) (expr, alias string) {
+	m := regexp.MustCompile(`(?is)^(.*?)\s+as\s+([a-zA-Z0-9_"` + "`" + `]+)$`).FindStringSubmatch(strings.TrimSpace(item))
+	if len(m) == 3 {
+		return strings.TrimSpace(m[1]), unquoteIdent(m[2])
+	}
+	return strings.TrimSpace(item), ""
+}
+
+func parseSimpleColumnExpr(expr string) string {
+	e := strings.TrimSpace(expr)
+	if strings.ContainsAny(e, "()") {
+		return ""
+	}
+	parts := strings.Split(e, ".")
+	last := parts[len(parts)-1]
+	if last == "*" {
+		return ""
+	}
+	return unquoteIdent(last)
+}
+
+func unquoteIdent(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, `"`) && strings.HasSuffix(s, `"`) && len(s) >= 2 {
+		return s[1 : len(s)-1]
+	}
+	return s
 }
 
 // fetchNames executes the given query with an optional name parameter,

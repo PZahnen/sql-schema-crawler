@@ -152,6 +152,12 @@ func TestAnalyzeSQLiteNewFeatures(t *testing.T) {
 	if !v.IsView {
 		t.Fatalf("expected places_view meta to be flagged as view")
 	}
+	if len(v.BaseColumns) == 0 {
+		t.Fatalf("expected view base column mapping to be present")
+	}
+	if !hasColumnFlag(v, "id", func(c ColumnMeta) bool { return c.IsPrimary && c.IsUnique }) {
+		t.Fatalf("expected view column id to inherit primary/unique from base table column")
+	}
 	if allColumnsReadOnly(v) {
 		t.Fatalf("did not expect all view columns to be read-only (xtraplatform-style read-only is column-metadata based)")
 	}
