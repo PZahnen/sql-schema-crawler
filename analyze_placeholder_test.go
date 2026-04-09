@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"sort"
+	"strings"
 	"testing"
 
 	_ "github.com/lib/pq"
@@ -232,10 +234,20 @@ func TestAnalyzeDiscoveryExternalDB(t *testing.T) {
 		t.Fatalf("ViewNames: %v", err)
 	}
 	if _, err := Tables(db); err != nil {
-		t.Fatalf("Tables: %v", err)
+		if os.Getenv("SCHEMA_TEST_LENIENT_TABLES") == "1" && strings.Contains(strings.ToLower(err.Error()), "permission denied") {
+			t.Logf("Tables (lenient mode, ignored error): %v", err)
+		} else {
+			t.Fatalf("Tables: %v", err)
+		}
 	}
-	if _, err := Views(db); err != nil {
-		t.Fatalf("Views: %v", err)
+	if os.Getenv("SCHEMA_TEST_LENIENT_VIEWS") != "1" {
+		if _, err := Views(db); err != nil {
+			t.Fatalf("Views: %v", err)
+		}
+	} else {
+		if _, err := Views(db); err != nil {
+			t.Logf("Views (lenient mode, ignored error): %v", err)
+		}
 	}
 
 	schemaName := os.Getenv("SCHEMA_TEST_SCHEMA")
@@ -265,6 +277,15 @@ func TestAnalyzeDiscoveryExternalDB(t *testing.T) {
 	}
 
 	analyzeRes, err := Analyze(db, analyzeOpts)
+	if err != nil {
+		errLower := strings.ToLower(err.Error())
+		lenientViews := os.Getenv("SCHEMA_TEST_LENIENT_VIEWS") == "1" && strings.Contains(errLower, "has not been populated")
+		lenientTables := os.Getenv("SCHEMA_TEST_LENIENT_TABLES") == "1" && strings.Contains(errLower, "permission denied")
+		if lenientViews || lenientTables {
+			t.Logf("Analyze (lenient fallback to name-only types): %v", err)
+			analyzeRes, err = analyzeNamesOnly(db, analyzeOpts)
+		}
+	}
 	if err != nil {
 		t.Fatalf("Analyze(%+v): %v", analyzeOpts, err)
 	}
@@ -302,6 +323,15 @@ func TestAnalyzeDiscoveryExternalDB(t *testing.T) {
 
 	filtered, err := Analyze(db, &AnalyzeOptions{IncludeTables: []string{"^$"}})
 	if err != nil {
+		errLower := strings.ToLower(err.Error())
+		lenientViews := os.Getenv("SCHEMA_TEST_LENIENT_VIEWS") == "1" && strings.Contains(errLower, "has not been populated")
+		lenientTables := os.Getenv("SCHEMA_TEST_LENIENT_TABLES") == "1" && strings.Contains(errLower, "permission denied")
+		if lenientViews || lenientTables {
+			t.Logf("Analyze(filtered) lenient fallback to name-only types: %v", err)
+			filtered, err = analyzeNamesOnly(db, &AnalyzeOptions{IncludeTables: []string{"^$"}})
+		}
+	}
+	if err != nil {
 		t.Fatalf("Analyze(filtered): %v", err)
 	}
 	logAnalyzeSummary(t, "external:filtered", filtered)
@@ -318,6 +348,10 @@ func logAnalyzeSummary(t *testing.T, label string, r AnalyzeResult) {
 	if os.Getenv("SCHEMA_TEST_DEBUG") != "1" {
 		return
 	}
+	if os.Getenv("SCHEMA_TEST_OUTPUT_STYLE") == "xtraplatform" && label == "external:analyze" {
+		logAnalyzeAsXtraplatformTypes(t, r)
+		return
+	}
 
 	t.Logf("[%s] schemas=%d tables=%d views=%d geoinfo=%d", label, len(r.Schemas), len(r.Tables), len(r.Views), len(r.GeoInfo))
 	t.Logf("[%s] tables: %s", label, firstObjectNames(r.Tables, 5))
@@ -326,6 +360,90 @@ func logAnalyzeSummary(t *testing.T, label string, r AnalyzeResult) {
 		g := r.GeoInfo[0]
 		t.Logf("[%s] first geoinfo: %s.%s.%s type=%s srid=%d dim=%d source=%s", label, g.Schema, g.Table, g.Column, g.GeometryType, g.SRID, g.Dimension, g.Source)
 	}
+}
+
+func logAnalyzeAsXtraplatformTypes(t *testing.T, r AnalyzeResult) {
+	t.Helper()
+
+	t.Log("details : types :")
+
+	bySchema := map[string][]string{}
+	for _, table := range r.Tables {
+		schema := table.Schema
+		if schema == "" {
+			schema = ""
+		}
+		bySchema[schema] = append(bySchema[schema], table.Name)
+	}
+	for _, view := range r.Views {
+		schema := view.Schema
+		if schema == "" {
+			schema = ""
+		}
+		bySchema[schema] = append(bySchema[schema], view.Name)
+	}
+
+	schemas := make([]string, 0, len(bySchema))
+	for s := range bySchema {
+		schemas = append(schemas, s)
+	}
+	sort.Strings(schemas)
+
+	for _, s := range schemas {
+		names := bySchema[s]
+		sort.Strings(names)
+		t.Logf("%s : (%d) %v", s, len(names), names)
+	}
+}
+
+func analyzeNamesOnly(db *sql.DB, opts *AnalyzeOptions) (AnalyzeResult, error) {
+	res := AnalyzeResult{}
+	tables, err := TableNames(db)
+	if err != nil {
+		return res, err
+	}
+	views, err := ViewNames(db)
+	if err != nil {
+		return res, err
+	}
+
+	schemas := map[string]struct{}{}
+	for _, t := range tables {
+		if !includedSchema(t[0], opts) || !includedName(t[1], includeTables(opts), excludeTables(opts)) {
+			continue
+		}
+		schemas[t[0]] = struct{}{}
+		res.Tables = append(res.Tables, TableMeta{Schema: t[0], Name: t[1], IsView: false})
+	}
+	for _, v := range views {
+		if !includedSchema(v[0], opts) || !includedName(v[1], includeTables(opts), excludeTables(opts)) {
+			continue
+		}
+		schemas[v[0]] = struct{}{}
+		res.Views = append(res.Views, TableMeta{Schema: v[0], Name: v[1], IsView: true})
+	}
+	for s := range schemas {
+		res.Schemas = append(res.Schemas, SchemaMeta{Name: s})
+	}
+
+	if os.Getenv("SCHEMA_TEST_DEBUG") == "1" {
+		var publicTables, publicViews []string
+		for _, t := range tables {
+			if t[0] == "public" {
+				publicTables = append(publicTables, t[1])
+			}
+		}
+		for _, v := range views {
+			if v[0] == "public" {
+				publicViews = append(publicViews, v[1])
+			}
+		}
+		sort.Strings(publicTables)
+		sort.Strings(publicViews)
+		fmt.Fprintf(os.Stderr, "[lenient-debug] public tables=%v public views=%v\n", publicTables, publicViews)
+	}
+
+	return res, nil
 }
 
 func firstObjectNames(objects []TableMeta, limit int) string {

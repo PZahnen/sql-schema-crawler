@@ -26,13 +26,17 @@ const postgresAllColumns = `SELECT * FROM %s LIMIT 0`
 
 const postgresTableNamesWithSchema = `
 	SELECT
-		table_schema,
-		table_name
+		n.nspname AS table_schema,
+		c.relname AS table_name
 	FROM
-		information_schema.tables
+		pg_catalog.pg_class c
+	JOIN
+		pg_catalog.pg_namespace n
+	ON	c.relnamespace = n.oid
 	WHERE
-		table_type = 'BASE TABLE' AND
-		table_schema NOT IN ('pg_catalog', 'information_schema')
+		c.relkind IN ('r', 'f', 'p') AND
+		n.nspname NOT IN ('pg_catalog', 'information_schema', 'tiger', 'tiger_data', 'topology') AND
+		c.relname NOT IN ('spatial_ref_sys', 'geography_columns', 'geometry_columns', 'raster_columns', 'raster_overviews')
 	ORDER BY
 		table_schema,
 		table_name
@@ -46,7 +50,17 @@ const postgresViewNamesWithSchema = `
 		information_schema.tables
 	WHERE
 		table_type = 'VIEW' AND
-		table_schema NOT IN ('pg_catalog', 'information_schema')
+		table_schema NOT IN ('pg_catalog', 'information_schema', 'tiger', 'tiger_data', 'topology') AND
+		table_name NOT IN ('spatial_ref_sys', 'geography_columns', 'geometry_columns', 'raster_columns', 'raster_overviews')
+	UNION
+	SELECT
+		schemaname AS table_schema,
+		matviewname AS table_name
+	FROM
+		pg_catalog.pg_matviews
+	WHERE
+		schemaname NOT IN ('pg_catalog', 'information_schema', 'tiger', 'tiger_data', 'topology') AND
+		matviewname NOT IN ('spatial_ref_sys', 'geography_columns', 'geometry_columns', 'raster_columns', 'raster_overviews')
 	ORDER BY
 		table_schema,
 		table_name
