@@ -1,4 +1,4 @@
-module github.com/jimsmart/schema
+module github.com/PZahnen/sql-schema-crawler
 
 go 1.16
 
